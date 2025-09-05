@@ -1,5 +1,5 @@
 -- awake: time changes
--- 2.6.0 @tehn
+-- 2.7.0 @tehn
 -- l.llllllll.co/awake
 --
 -- top loop plays notes
@@ -40,6 +40,7 @@ options = {}
 options.OUT = {"audio", "midi", "audio + midi", "crow out 1+2", "crow ii JF", "crow ii 301"}
 
 g = grid.connect()
+a = arc.connect()
 
 alt = false
 running = true
@@ -58,6 +59,15 @@ two = {
   length = 7,
   data = {5,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
 }
+
+-- Function to update crow action dynamically
+function update_crow_action()
+  if params:get("out") == 4 then
+    local attack = params:get("crow_attack")
+    local release = params:get("crow_release")
+    crow.output[2].action = "ar(" .. attack .. "," .. release .. ",10,'linear')"
+  end
+end
 
 function add_pattern_params() 
   params:add_separator("pattern data")
@@ -108,6 +118,7 @@ snd_params = {"cutoff","gain","pw","release", "delay_feedback","delay_rate", "pa
 NUM_SND_PARAMS = #snd_params
 
 notes_off_metro = metro.init()
+arc_redraw_metro = metro.init()
 
 function build_scale()
   notes = MusicUtil.generate_scale_of_length(params:get("root_note"), params:get("scale_mode"), 16)
@@ -153,7 +164,7 @@ function step()
 
       if one.data[one.pos] > 0 then
         local note_num = notes[one.data[one.pos]+two.data[two.pos]]
-        local freq = MusicUtil.note_num_to_freq(note_num)
+        local freq = MusicUtil.note_num_to_freq(note_num + (params:get("detune")*0.01))
         -- Trig Probablility
         if math.random(100) <= params:get("probability") then
           -- Audio engine out
@@ -161,7 +172,7 @@ function step()
             engine.hz(freq)
           elseif params:get("out") == 4 then
             crow.output[1].volts = (note_num-60)/12
-            crow.output[2].execute()
+            crow.output[2]()
           elseif params:get("out") == 5 then
             crow.ii.jf.play_note((note_num-60)/12,5)
           elseif params:get("out") == 6 then -- er301
@@ -183,9 +194,7 @@ function step()
         end
       end
 
-      if g then
-        gridredraw()
-      end
+      gridredraw()
       redraw()
     else
     end
@@ -202,11 +211,12 @@ function start()
 end
 
 function reset()
-  one.pos = 1
-  two.pos = 1
+  one.pos = 0
+  two.pos = 0
 end
 
 function clock.transport.start()
+  reset()
   start()
 end
 
@@ -252,17 +262,20 @@ function init()
   build_midi_device_list()
 
   notes_off_metro.event = all_notes_off
+  arc_redraw_metro.event = arcredraw
+  arc_redraw_metro:start(1 / 60)
+
   
   params:add_separator("AWAKE")
   
   params:add_group("outs",3)
   params:add{type = "option", id = "out", name = "out",
-    options = options.OUT,
+    options = options.OUT, default = 4,
     action = function(value)
       all_notes_off()
-      if value == 4 then crow.output[2].action = "{to(5,0),to(0,0.25)}"
+      if value == 4 then 
+        update_crow_action()
       elseif value == 5 or value == 6 then
-        crow.ii.pullup(true)
         crow.ii.jf.mode(1)
       end
     end}
@@ -275,6 +288,18 @@ function init()
     action = function(value)
       all_notes_off()
       midi_channel = value
+    end}
+    
+  params:add_group("crow attack/release",2)
+  cs_CROW_ATT = controlspec.new(0.01,5,'lin',0.01,0.01,'s')
+  params:add{type="control",id="crow_attack",name="attack",controlspec=cs_CROW_ATT,
+    action = function(value) 
+      update_crow_action() 
+    end}
+  cs_CROW_REL = controlspec.new(0.01,5,'lin',0.01,0.5,'s')
+  params:add{type="control",id="crow_release",name="release",controlspec=cs_CROW_REL,
+    action = function(value) 
+      update_crow_action() 
     end}
   
   params:add_group("step",8)
@@ -299,7 +324,7 @@ function init()
   params:add{type = "trigger", id = "reset", name = "reset",
     action = function() reset() end}
   
-  params:add_group("synth",6)
+  params:add_group("synth", 7)
   cs_AMP = controlspec.new(0,1,'lin',0,0.5,'')
   params:add{type="control",id="amp",controlspec=cs_AMP,
     action=function(x) engine.amp(x) end}
@@ -324,8 +349,23 @@ function init()
   params:add{type="control",id="pan",controlspec=cs_PAN,
     action=function(x) engine.pan(x) end}
 
+  params:add{type="number",id="detune",min=-100, max=100, default=0}
+
   hs.init()
-  
+
+  params:add{type="option",id="grid_rotation",name="Grid rotation",
+    options={"0","90","180","270"},default=1,
+    action=function(value)
+      if g then
+        g:rotation(value - 1)
+        gridredraw()
+      end
+    end
+  }
+
+  params:add{type="option",id="arc_rotation",name="Arc rotation",
+    options={"0","90","180","270"},default=1}
+
   add_pattern_params()
   params:default()
   midi_device.event = midi_event
@@ -359,6 +399,10 @@ function g.key(x, y, z)
 end
 
 function gridredraw()
+  if not g then
+    return
+  end
+
   local grid_h = g.rows
   g:all(0)
   if edit_ch == 1 or grid_h == 16 then
@@ -384,6 +428,67 @@ function gridredraw()
     end
   end
   g:refresh()
+end
+
+function a.delta(n, d)
+  if n == 1 then
+    params:delta("pw", 0.2 * d)
+  elseif n == 2 then
+    -- cutoff is exponential; we use the controlspec
+    -- for adjustments to feel natural
+    local now = cs_CUT:unmap(params:get("cutoff"))
+    local delta = 0.002
+    params:set("cutoff", cs_CUT:map(now + delta * d))
+  elseif n == 3 then
+    params:delta("gain", 0.2 * d)
+  elseif n == 4 then
+    params:delta("release", 0.2 * d)
+  end
+end
+
+function arcredraw()
+  if not a then
+    return
+  end
+
+  -- Arc doesn't have built-in rotation support so we do
+  -- it ourselves.
+  local rot = 16 * (params:get("arc_rotation") - 1)
+  a:all(0)
+  a:led(1, rot + 1, 4)
+  a:led(2, rot + 1, 4)
+  a:led(3, rot + 1, 4)
+  a:led(4, rot + 1, 4)
+
+  -- ARC 1
+  local percentage = 64 * cs_PW:unmap(params:get("pw"))
+  for i=1,64 do
+    if percentage >= i then
+      a:led(1, (i-1 + rot) % 64 + 1, 15)
+    end
+  end
+  -- ARC 2
+  percentage = 64 * cs_CUT:unmap(params:get("cutoff"))
+  for i=1,64 do
+    if percentage >= i then
+      a:led(2, (i-1 + rot) % 64 + 1, 15)
+    end
+  end
+  -- ARC 3
+  percentage = 64 * cs_GAIN:unmap(params:get("gain"))
+  for i=1,64 do
+    if percentage >= i then
+      a:led(3, (i-1 + rot) % 64 + 1, 15)
+    end
+  end
+  -- ARC 4
+  percentage = 64 * cs_REL:unmap(params:get("release"))
+  for i=1,64 do
+    if percentage >= i then
+      a:led(4, (i-1 + rot) % 64 + 1, 15)
+    end
+  end
+  a:refresh()
 end
 
 function enc(n, delta)
